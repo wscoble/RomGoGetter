@@ -163,6 +163,34 @@ RomGoGetter_dat_groups.json  # auto-created, persists DAT groups
 
 ---
 
+## Indexer service (headless)
+
+This fork also exposes a Torznab + Transmission RPC service that runs headless in a container. Discoverable by Questarr, Sonarr, and Radarr. See `indexer/README.md`.
+
+```bash
+# Local dev
+nix run .#indexer
+# Or with pythonEnv
+RGG_API_KEY=changeme python -m indexer.server
+```
+
+Smoke test:
+
+```bash
+curl 'http://localhost:9696/api?t=search&q=Bomberman&apikey=test-key'
+```
+
+---
+
+## Deployment
+
+The `scripts/` directory holds two helpers:
+
+- `scripts/questarr-cleanup.sh` — removes non-RomGoGetter indexers and qBittorrent downloaders from a Questarr install (API or DB mode)
+- `scripts/questarr-cleanup.sh discover` — best-effort guess of where Questarr lives (k3s, docker, podman, common DB paths)
+
+---
+
 ## Credits
 
 - **[Internet Archive](https://archive.org)** — the world's library. [Donate](https://archive.org/donate)
