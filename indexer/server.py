@@ -22,10 +22,13 @@ from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 
 # Make the fork's modules importable. The flake.nix wires /app to be the
 # fork root, so rgg.py sits at /app/rgg.py and RomGoGetter_groups.json at /app/.
-sys.path.insert(0, "/app")
-sys.path.insert(0, "/app/indexer")
-
-from . import pipeline, state, torznab, transmission
+import os as _os, sys as _sys
+_APP_ROOT = _os.environ.get("RGG_APP_ROOT", "/app")
+_INDEXER_DIR = _os.path.join(_APP_ROOT, "indexer")
+for _p in (_APP_ROOT, _INDEXER_DIR):
+    if _p not in _sys.path:
+        _sys.path.insert(0, _p)
+import pipeline, state, torznab, transmission  # type: ignore  # noqa: E402
 
 app = FastAPI(title="RomGoGetter Indexer")
 
@@ -35,6 +38,7 @@ _API_KEY = os.environ.get("RGG_API_KEY") or secrets.token_urlsafe(16)
 
 @app.on_event("startup")
 async def _banner():
+    pipeline.startup_recover()
     print(f"======================================================================", flush=True)
     print(f"RomGoGetter Indexer", flush=True)
     print(f"  Torznab    :  GET  /api?t=...", flush=True)
@@ -42,6 +46,7 @@ async def _banner():
     print(f"  API key    :  {_API_KEY}", flush=True)
     print(f"  NAS root   :  {pipeline.NAS_ROOT}", flush=True)
     print(f"  State path :  {state.STATE_PATH}", flush=True)
+    print(f"  Groups     :  {len(pipeline.GROUPS)}", flush=True)
     print(f"======================================================================", flush=True)
 
 

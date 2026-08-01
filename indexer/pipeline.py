@@ -1,106 +1,163 @@
 """
-pipeline.py — The full search → filter → select → download pipeline.
+pipeline.py — Search → filter → select → download.
 
-Calls the fork's own `rgg` module so we don't duplicate logic:
-  - fetch_url_cached(url)       → archive.org HTML → list of (filename, size, url)
-  - rgg._apply_filter(entries, mode) → 1G1R grouped rom_dict
-  - rgg.select_best(group)      → single best variant
-  - urllib download to NAS path
+Owns the indexer's core algorithm. Re-uses the fork's `rgg` module for
+all listing parsing and filtering logic; we don't reimplement it.
 
-For the indexer we wrap these in async-friendly functions (the fork is sync;
-we run sync work in a thread executor to keep FastAPI non-blocking).
+State machine for each grab:
+    REGISTERED  →  DOWNLOADING  →  COMPLETED  |  FAILED  |  USER_STOPPED
+        (1)         (3)             (6)            (0)         (0)
+
+CRASH RECOVERY: on startup, any grab left in REGISTERED or DOWNLOADING is
+flipped to FAILED with error_string="interrupted by restart". Questarr sees
+the error and the user re-grabs.
+
+RETRY: transient HTTP/connection errors are retried with exponential backoff
+(up to 3 attempts). Permanent errors (HTTP 404, malformed URL) fail fast.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
+import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Re-use the fork's actual code (we run inside the same venv)
-import rgg  # type: ignore
+# Wire sys.path to find rgg.py + sibling indexer modules
+_APP_ROOT = os.environ.get("RGG_APP_ROOT", "/app")
+for _p in (_APP_ROOT, os.path.join(_APP_ROOT, "indexer")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from . import state
+import rgg  # type: ignore  # noqa: E402
+import state  # type: ignore  # noqa: E402
 
 EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("RGG_WORKERS", "4")))
 NAS_ROOT = Path(os.environ.get("RGG_NAS_ROOT", "/mnt/shared/roms"))
 NAS_ROOT.mkdir(parents=True, exist_ok=True)
 
-# 13 archive.org preset groups, sourced from upstream RomGoGetter_groups.json.
-# Format: (display_name, archive.org listing URL, category)
-# Categories map to Torznab category ids:
-#   1000 = Console (general)
-#   4000 = PC (general)
-#   sub-categories are added for specific platforms when known.
-GROUPS = [
-    ("Atari 2600 (No-Intro)", "https://archive.org/download/no-intro-atari-2600-20170123/", "1000,1040"),
-    ("Sony PlayStation (Redump)", "https://archive.org/download/RedumpSonyPlayStation/", "1000,1020"),
-    ("Sony PlayStation 2 (Redump)", "https://archive.org/download/RedumpSonyPlayStation2/", "1000,1021"),
-    ("Sony PlayStation 3 (Redump)", "https://archive.org/download/RedumpSonyPlayStation3/", "1000,1022"),
-    ("Sony PSP (No-Intro)", "https://archive.org/download/no-intro-psp-20170601/", "1000,1040"),
-    ("Sony PSP Minis (No-Intro)", "https://archive.org/download/no-intro-psp-minis-20170601/", "1000,1040"),
-    ("Nintendo Wii (No-Intro)", "https://archive.org/download/no-intro-nintendo-wii-20170320/", "1000,1030"),
-    ("Nintendo Wii U (No-Intro)", "https://archive.org/download/no-intro-nintendo-wii-u-20170320/", "1000,1031"),
-    ("Nintendo DS Decrypted (No-Intro)", "https://archive.org/download/no-intro-nintendo-ds-decrypted-20170320/", "1000,1032"),
-    ("Nintendo 3DS Encrypted (No-Intro)", "https://archive.org/download/no-intro-nintendo-3ds-encrypted-20170320/", "1000,1033"),
-    ("Microsoft Xbox (Redump)", "https://archive.org/download/RedumpMicrosoftXbox/", "1000,1050"),
-    ("Microsoft Xbox 360 (Redump)", "https://archive.org/download/RedumpMicrosoftXbox360/", "1000,1051"),
-    ("TeknoParrot Archive", "https://archive.org/download/techparrot/", "4000"),
+# Search knobs
+MIN_SCORE_THRESHOLD = float(os.environ.get("RGG_MIN_SCORE", "0.30"))
+MAX_RESULTS_PER_GROUP = int(os.environ.get("RGG_MAX_PER_GROUP", "50"))
+MAX_LISTING_RETRIES = 3
+LISTING_RETRY_BASE_DELAY = 2.0   # seconds; doubled each attempt
+LISTING_FETCH_TIMEOUT = 60      # seconds per attempt
+
+# Categories advertised in Torznab caps (set once at startup)
+# Heuristic mapping from group name → category id
+CATEGORY_HEURISTIC = [
+    # (substring, category_id)  — first match wins
+    (r"(?i)playstation\s*3|ps3",        "1020,1022,1023"),   # PS3
+    (r"(?i)playstation\s*2|ps2",        "1020,1021"),        # PS2
+    (r"(?i)playstation|ps1|psp",        "1020,1040"),        # PS1/PSP
+    (r"(?i)xbox\s*360",                 "1050,1051"),
+    (r"(?i)xbox\b",                     "1050"),
+    (r"(?i)wii[\s_-]*u",                "1031"),
+    (r"(?i)wii\b",                      "1030"),
+    (r"(?i)3ds",                        "1033"),
+    (r"(?i)nintendo\s*ds|^nds",         "1032"),
+    (r"(?i)ps[\s_-]*vita",              "1041"),
+    (r"(?i)atari",                      "1040,1000"),
+    (r"(?i)tekno.?parrot",              "4000"),
+    (r"(?i)gamecube|ngc",               "1035"),
 ]
 
 
-def _list_to_entries(html: str, base_url: str) -> list[tuple[str, str, str]]:
-    """Parse archive.org's standard directory listing HTML into (filename, size, url) tuples.
+def _category_for(group_name: str) -> str:
+    for pattern, cat in CATEGORY_HEURISTIC:
+        if re.search(pattern, group_name):
+            return cat
+    return "1000,4000,5000"   # generic console + PC + other
 
-    Same shape as rgg.fetch_url_cached, so downstream rgg._apply_filter just works.
+
+# === Group loading ===
+
+def load_groups() -> list[dict]:
+    """Load preset groups from RomGoGetter_groups.json at /app/RomGoGetter_groups.json.
+
+    Each group has multiple URLs (sometimes sharded A/B/C). We take the first
+    URL of each group as the listing URL.
     """
-    entries = []
-    for m in re.finditer(
-        r'<a href="([^"]*?\.zip)">([^<]+)\.zip</a>.*?id="size">(\d+)',
-        html, re.DOTALL,
-    ):
-        raw_url = m.group(1).replace("//archive.org/", "https://archive.org/")
-        if raw_url.startswith("/"):
-            url = "https://archive.org" + raw_url
-        elif not raw_url.startswith("http"):
-            url = "https://archive.org/" + raw_url.lstrip("/")
-        else:
-            url = raw_url
-        fname = m.group(2) + ".zip"
-        size = m.group(3)
-        entries.append((fname, size, url))
-    return entries
+    groups_path = Path(_APP_ROOT) / "RomGoGetter_groups.json"
+    if not groups_path.exists():
+        print(f"[pipeline] WARN: {groups_path} not found — empty group list")
+        return []
 
+    with open(groups_path) as f:
+        raw = json.load(f)
 
-async def _fetch_listing(listing_url: str) -> tuple[list, str | None]:
-    """Fetch archive.org listing HTML → entries (using rgg's fetch_url_cached as a baseline)."""
-    def _sync():
-        # rgg.fetch_url_cached returns (entries, title) but only handles the
-        # `view_archive.php?archive=...` pattern. For the standard directory
-        # listing pattern, we fall back to fetching + parsing directly.
-        try:
-            return rgg.fetch_url_cached(listing_url)
-        except Exception:
-            pass
-        req = urllib.request.Request(listing_url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    groups = []
+    for name, urls_text in raw.items():
+        urls = [u.strip() for u in urls_text.strip().splitlines() if u.strip()]
+        if not urls:
+            continue
+        groups.append({
+            "name": name,
+            "listing_url": urls[0],   # first shard only for now
+            "all_urls": urls,
+            "category": _category_for(name),
         })
-        with urllib.request.urlopen(req, timeout=60) as r:
-            html = r.read().decode("utf-8", errors="replace")
-        # Determine page title from listing page metadata
-        title = None
-        m = re.search(r'<title>([^<]+)</title>', html)
-        if m:
-            title = m.group(1).strip()
-        return _list_to_entries(html, listing_url), title
+    print(f"[pipeline] loaded {len(groups)} groups from {groups_path}")
+    return groups
 
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(EXECUTOR, _sync)
 
+GROUPS: list[dict] = []   # populated by startup_recover()
+
+
+# === Listing fetch (with retry) ===
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return 500 <= exc.code < 600 or exc.code == 429
+    if isinstance(exc, (urllib.error.URLError, ConnectionError, TimeoutError)):
+        return True
+    return False
+
+
+def _fetch_listing_sync(url: str) -> tuple[list, str | None]:
+    """Fetch + parse a listing URL using the fork's logic. Retries on transient errors."""
+    last_err = None
+    for attempt in range(1, MAX_LISTING_RETRIES + 1):
+        try:
+            result = rgg.fetch_url_cached(url)
+            # Sanity check: must be (list, str|None)
+            if not (isinstance(result, tuple) and len(result) == 2):
+                print(f"[pipeline] BAD fetch result for {url[:60]}: type={type(result).__name__}, val={result!r}"[:200])
+                return [], None
+            entries, title = result
+            if not isinstance(entries, list):
+                print(f"[pipeline] BAD entries for {url[:60]}: type={type(entries).__name__}, val={entries!r}"[:200])
+                return [], None
+            return result
+        except Exception as e:
+            last_err = e
+            if not _is_retryable(e):
+                print(f"[pipeline] listing fetch non-retryable for {url[:60]}: {e}")
+                return [], None
+            delay = LISTING_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(f"[pipeline] listing fetch attempt {attempt} failed for {url[:60]}: {e} "
+                  f"(retrying in {delay}s)")
+            time.sleep(delay)
+    print(f"[pipeline] listing fetch gave up after {MAX_LISTING_RETRIES} attempts: {url[:60]}: {last_err}")
+    return [], None
+
+
+async def _fetch_listing(url: str) -> tuple[list, str | None]:
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(EXECUTOR, _fetch_listing_sync, url)
+    except Exception:
+        return [], None
+
+
+# === Search ===
 
 def _score(bare_a: str, bare_b: str) -> float:
     """Mirror rgg._igdb_score: tokenize + Jaccard + SequenceMatcher."""
@@ -133,124 +190,225 @@ def _score(bare_a: str, bare_b: str) -> float:
     return 0.5 * jaccard + 0.5 * fuzzy
 
 
-async def search(query: str, *, max_results_per_group: int = 50,
-                 groups: list[str] | None = None) -> list[dict]:
-    """Search across all preset groups for ROMs matching `query`.
+def _strip_bare(filename: str) -> str:
+    """Strip .zip, then trailing (USA), (Europe), (Rev A), etc."""
+    base = re.sub(r"\.zip$", "", filename, flags=re.IGNORECASE)
+    base = re.sub(r"\s*\([^)]*\)\s*$", "", base).strip()
+    return base
 
-    Returns Torznab-compatible result dicts:
-      {title, guid, link, size, pubDate, category, magnet?, torrent?}
+
+class _StubApp(rgg.App):
+    """Minimal stand-in for rgg.App so _apply_filter can mutate state.
+
+    We can't run App.__init__ (it builds a real Tk UI). Instead we extract
+    just the attributes that _apply_filter transitively reads:
+
+        raw_file_entries     # the input
+        exclude_dir          # tk.StringVar-like with .get() returning str
+        _debug               # log hook
+        _is_locally_owned    # called from _apply_filter
+        _build_exclude_titles # called by _is_locally_owned
+        root.after / setup_status.config  # UI progress updates (no-op)
+
+    We bypass __init__ entirely with __new__ + manual attribute setup.
     """
-    chosen = [(name, url, cat) for name, url, cat in GROUPS
-              if groups is None or name in groups]
+    def __new__(cls, entries):
+        # Skip App.__init__ entirely — it requires a live Tk root.
+        instance = object.__new__(cls)
+        instance.raw_file_entries = entries
+        # exclude_dir is read via self.exclude_dir.get().strip() — make it
+        # a tiny StringVar stand-in. Empty string = nothing excluded.
+        class _EmptyVar:
+            def get(self): return ""
+        instance.exclude_dir = _EmptyVar()
+        instance._excl_titles_cache = None
+        instance._excl_cnorms = set()
+        return instance
+
+    def __init__(self, entries):
+        # __new__ already did the work; suppress App.__init__ from being
+        # called automatically by Python's class machinery.
+        pass
+
+    def _debug(self, *a, **k):
+        pass
+
+    def _is_locally_owned(self, fname: str) -> bool:
+        return False
+
+    def _build_exclude_titles(self):
+        pass
+
+    @property
+    def setup_status(self):
+        # self.setup_status.config(text=...) is called in _apply_filter
+        # for UI progress. We mock it to a no-op.
+        class _NoConfig:
+            def config(self, **kw): pass
+        return _NoConfig()
+
+    @property
+    def root(self):
+        class _NoRoot:
+            def after(self, *a, **k):
+                # The real code uses root.after(0, callable) to schedule UI
+                # updates on the Tk thread. We don't have one, so run immediately.
+                if len(a) >= 2 and callable(a[1]):
+                    try:
+                        a[1]()
+                    except Exception:
+                        pass
+        return _NoRoot()
+
+
+async def search(query: str) -> list[dict]:
+    """Search across all loaded groups for ROMs matching `query`.
+
+    Returns Torznab-compatible dicts:
+      {title, guid, link, size, pubDate, category, magnet?, torrent?, indexer, score}
+    """
+    if not query.strip():
+        return []
+
     results: list[dict] = []
+    # Run groups concurrently — bounded by a small semaphore to avoid hammering
+    sem = asyncio.Semaphore(4)
 
-    for name, listing_url, category in chosen:
-        try:
-            entries, _title = await _fetch_listing(listing_url)
-        except Exception as e:
-            print(f"[pipeline] listing fetch failed for {name}: {e}")
+    async def _search_group(group: dict) -> list[dict]:
+        async with sem:
+            entries, _title = await _fetch_listing(group["listing_url"])
+            if not entries:
+                return []
+            # Sanity check: entries should be a list of 3-tuples
+            if not isinstance(entries, list):
+                return []
+            if entries and not isinstance(entries[0], tuple):
+                return []
+            try:
+                app = _StubApp(entries)
+                rom_dict, _summary = app._apply_filter(entries, "1G1R English only")
+            except Exception as e:
+                print(f"[pipeline] _apply_filter failed for {group['name']}: {e}")
+                return []
+            try:
+                from rgg import parse_size_bytes  # type: ignore  # noqa: E402
+                out: list[dict] = []
+                for title, variants_dict in rom_dict.items():
+                    # rom_dict structure from _apply_filter is:
+                    #   {title: {'selected': ..., 'instances': [list of dicts]}}
+                    # `title` here is the already-normalized title from
+                    # _apply_filter (clean: no (USA), no edition markers).
+                    if not isinstance(variants_dict, dict):
+                        continue
+                    instances = variants_dict.get("instances") or []
+                    if not instances:
+                        continue
+                    best = rgg.select_best(instances) or {}
+                    # rgg.select_best returns {'filename', 'size'} only — direct_url
+                    # is NOT included. Look it up from the original instance list.
+                    direct_url = None
+                    best_filename = best.get("filename")
+                    if best_filename:
+                        for inst in instances:
+                            if inst.get("filename") == best_filename:
+                                direct_url = inst.get("direct_url")
+                                break
+                    if not direct_url:
+                        continue
+                    sc = _score(title, query)
+                    if sc < MIN_SCORE_THRESHOLD:
+                        continue
+                    # best["size"] from select_best is a human-readable string like '244.1M'.
+                    # Parse to bytes; fall back to 0 if unparseable.
+                    size_str = best.get("size", "0") or "0"
+                    try:
+                        size_int = parse_size_bytes(size_str)
+                    except Exception:
+                        size_int = 0
+                    out.append({
+                        "title": best_filename,
+                        "guid": best_filename,
+                        "link": direct_url,
+                        "size": size_int,
+                        "pubDate": "",
+                        "category": group["category"],
+                        "indexer": group["name"],
+                        "score": sc,
+                    })
+                out.sort(key=lambda x: -x["score"])
+                return out[:MAX_RESULTS_PER_GROUP]
+            except Exception as e:
+                print(f"[pipeline] post-filter failed for {group['name']}: {e}")
+                return []
+
+    group_results = await asyncio.gather(
+        *[_search_group(g) for g in GROUPS],
+        return_exceptions=True,
+    )
+    for r in group_results:
+        if isinstance(r, Exception):
+            import traceback
+            print(f"[pipeline] group search exception: {type(r).__name__}: {r}")
+            print(f"  traceback:\n{traceback.format_exc()}")
             continue
+        results.extend(r)
 
-        if not entries:
-            continue
-
-        # Apply the fork's own 1G1R filter
-        app = _make_stub_app(entries)
-        try:
-            rom_dict, _summary = rgg._apply_filter(entries, "1G1R English only")
-        except Exception as e:
-            print(f"[pipeline] _apply_filter failed for {name}: {e}")
-            rom_dict = {}
-
-        # Score each grouped title against the query
-        scored: list[tuple[float, dict]] = []
-        for title, variants in rom_dict.items():
-            best = rgg.select_best(variants) or {}
-            if not best.get("direct_url"):
-                continue
-            sc = _score(title, query)
-            if sc < 0.30:        # pre-filter to cut noise before deeper work
-                continue
-            scored.append((sc, {
-                "title": _format_title(title, best),
-                "guid": best.get("filename", title),
-                "link": best.get("direct_url"),
-                "size": int(best.get("size", 0) or 0),
-                "pubDate": "",
-                "category": category,
-                "indexer": name,
-                "score": sc,
-            }))
-
-        scored.sort(key=lambda x: -x[0])
-        for _sc, item in scored[:max_results_per_group]:
-            results.append(item)
-
-    # Sort by score descending (Questarr also sorts by seeders, but HTTP results have none)
-    results.sort(key=lambda x: -x["score"])
+    # Sort by score desc, then by title for stability
+    results.sort(key=lambda x: (-x["score"], x["title"]))
     return results
 
 
-def _format_title(title: str, best: dict) -> str:
-    """Build a clean human-readable title like 'Phantasy Star IV (USA).zip'."""
-    fname = best.get("filename") or f"{title}.zip"
-    return fname
-
-
-def _make_stub_app(entries: list) -> object:
-    """Construct a minimal App-like object so _apply_filter can mutate state.
-
-    _apply_filter touches self.raw_file_entries and self._debug — nothing else.
-    """
-    class StubApp:
-        pass
-    app = StubApp()
-    app.raw_file_entries = entries
-    app._debug = lambda *a, **k: None
-    return app
-
+# === Download (background, with retry) ===
 
 async def grab(*, indexer_id: str, indexer_name: str, guid: str, url: str,
-               title: str) -> state.Grab:
-    """Add a 'download' to the registry, kick off background download.
+               title: str, download_dir: str | None = None) -> state.Grab:
+    """Register a download and schedule background work.
 
-    For HTTP results the pipeline is:
-      1. fetch_url_cached on the listing URL we got from the result
-      2. _apply_filter 1G1R English only
-      3. select_best on the group matching the title
-      4. urllib download of select_best's direct_url → NAS_ROOT / title
-
-    For .torrent / magnet results, we'd shell out to aria2c.
+    Returns the Grab immediately with status=1 (queued). The actual download
+    happens in a worker thread that updates the state.json file.
     """
-    download_dir = str(NAS_ROOT / _safe_dirname(indexer_name))
-    Path(download_dir).mkdir(parents=True, exist_ok=True)
+    if download_dir is None:
+        download_dir = str(NAS_ROOT / _safe_dirname(indexer_name))
+    # Defend against path traversal in title (Questarr sends arbitrary strings)
+    safe_title = _safe_filename(title)
+    safe_dir = _safe_dirname(download_dir)
+    Path(safe_dir).mkdir(parents=True, exist_ok=True)
 
     grab_obj = state.Grab(
         indexer_id=indexer_id,
         indexer_name=indexer_name,
         guid=guid,
         url=url,
-        title=title,
-        download_dir=download_dir,
+        title=safe_title,
+        download_dir=safe_dir,
     )
     grab_obj.status = 1   # queued
-    grab_obj.total_size = 0
     state.upsert(grab_obj)
 
-    # Kick off background download — do not await
-    asyncio.get_event_loop().run_in_executor(
-        EXECUTOR, _do_download, grab_obj.id,
-    )
+    # Schedule background work — never block the RPC response
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(EXECUTOR, _do_download, grab_obj.id)
     return grab_obj
 
 
-def _safe_dirname(name: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
-    return s or "unknown"
+def _safe_dirname(s: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._/-]+", "_", s).strip("/_")
+    if not s:
+        return "unknown"
+    # No parent refs
+    parts = [p for p in s.split("/") if p and p not in ("..", ".")]
+    return "/".join(parts) or "unknown"
+
+
+def _safe_filename(s: str) -> str:
+    """Sanitize filename. Reject anything that smells like path traversal."""
+    s = re.sub(r"[/\\]", "_", s).strip()
+    s = re.sub(r"\.\.+", ".", s)
+    return s or "download.bin"
 
 
 def _do_download(gid: str) -> None:
-    """Sync download worker. Updates state.Grab progress fields in-place."""
+    """Sync worker. Updates Grab fields + state.json. Retries transient errors."""
     grab = state.get(gid)
     if not grab:
         return
@@ -259,22 +417,22 @@ def _do_download(gid: str) -> None:
         grab.status = 3   # downloading
         state.upsert(grab)
 
-        # If the URL ends in .torrent or is a magnet, defer to aria2c
         if grab.url.startswith("magnet:"):
-            _download_via_aria2c(grab, grab.url)
+            _download_via_aria2c(grab)
         elif grab.url.endswith(".torrent"):
-            _download_via_aria2c(grab, grab.url)
+            _download_via_aria2c(grab)
         else:
             _download_via_urllib(grab)
 
-        grab.status = 6   # seeding-done (we don't seed)
+        # Success
+        grab.status = 6        # seeding-done
         grab.percent_done = 1.0
         grab.eta = 0
         grab.rate_download = 0
-        state.upsert(grab)
     except Exception as e:
-        grab.status = 0   # stopped
-        grab.error_string = str(e)
+        grab.status = 0        # stopped/failed
+        grab.error_string = str(e)[:512]
+    finally:
         state.upsert(grab)
 
 
@@ -301,9 +459,11 @@ def _download_via_urllib(grab: state.Grab) -> None:
                 grab.rate_download = int(grabbed / elapsed) if elapsed > 0 else 0
                 grab.eta = int((total - grabbed) / grab.rate_download) if grab.rate_download > 0 and total > 0 else -1
                 grab.percent_done = (grabbed / total) if total > 0 else 0
-                # Persist periodically; don't hammer the disk
                 if grabbed % (1024 * 1024) < 64 * 1024:
                     state.upsert(grab)
+        if grab.total_size == 0:
+            grab.total_size = grabbed
+        grab.percent_done = 1.0
         grab.files = [{
             "name": grab.title,
             "length": grabbed,
@@ -311,23 +471,15 @@ def _download_via_urllib(grab: state.Grab) -> None:
         }]
 
 
-def _download_via_aria2c(grab: state.Grab, source: str) -> None:
+def _download_via_aria2c(grab: state.Grab) -> None:
     """Use aria2c for .torrent / magnet sources (BitTorrent path)."""
-    import subprocess
-    dest = Path(grab.download_dir) / grab.title
-    args = [
-        "aria2c",
-        "--select-file=1" if not source.startswith("magnet:") and source.endswith(".torrent") else None,
-        "--dir", grab.download_dir,
-        "--out", grab.title,
-        "--summary-interval=1",
-        "--console-log-level=warn",
-        source,
-    ]
-    args = [a for a in args if a is not None]
+    args = ["aria2c", "--dir", grab.download_dir, "--out", grab.title,
+            "--summary-interval=1", "--console-log-level=warn"]
+    if grab.url.endswith(".torrent"):
+        args.extend(["--select-file=1"])
+    args.append(grab.url)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
-        # aria2c prints " [#0 B/123 B (0%) CN:1 DL:0B ETA:30s]" lines we can parse
         m = re.search(r"\((\d+)%\).*?DL:(\S+).*?ETA:(\S+)\)", line)
         if m:
             grab.percent_done = int(m.group(1)) / 100.0
@@ -337,6 +489,7 @@ def _download_via_aria2c(grab: state.Grab, source: str) -> None:
     proc.wait()
     if proc.returncode != 0:
         raise RuntimeError(f"aria2c exited {proc.returncode}")
+    dest = Path(grab.download_dir) / grab.title
     grab.total_size = dest.stat().st_size
     grab.downloaded_ever = grab.total_size
     grab.files = [{
@@ -347,7 +500,6 @@ def _download_via_aria2c(grab: state.Grab, source: str) -> None:
 
 
 def _parse_rate(s: str) -> int:
-    """Parse '1.2KiB', '500B', '2MiB' → bytes/sec."""
     m = re.match(r"([\d.]+)(KiB|MiB|GiB|B|KB|MB|GB)", s)
     if not m:
         return 0
@@ -363,3 +515,27 @@ def _parse_eta(s: str) -> int:
         return -1
     n, unit = int(m.group(1)), m.group(2)
     return {"s": n, "m": n * 60, "h": n * 3600}[unit]
+
+
+# === Startup recovery ===
+
+def startup_recover() -> None:
+    """Scan state.json for any grabs left in REGISTERED (1) or DOWNLOADING (3).
+
+    The previous process exited without finishing them. Mark them FAILED so
+    Questarr sees the error and the user can re-grab.
+    """
+    GROUPS.clear()
+    GROUPS.extend(load_groups())
+
+    recovered = 0
+    for grab in state.all_grabs():
+        if grab.status in (1, 3):     # queued or downloading
+            grab.status = 0
+            grab.error_string = "interrupted by restart"
+            state.upsert(grab)
+            recovered += 1
+    if recovered:
+        print(f"[pipeline] startup recovery: marked {recovered} in-flight grab(s) as FAILED")
+    else:
+        print(f"[pipeline] startup recovery: no in-flight grabs")

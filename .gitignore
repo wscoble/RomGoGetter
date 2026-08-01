@@ -1,8 +1,6 @@
-# Python
+# Local symlink for testing the indexer without renaming the source file
+rgg.py
 __pycache__/
 *.pyc
-*.pyo
-
-# Tooling
-.direnv/
-result*
+.envrc.local
+result

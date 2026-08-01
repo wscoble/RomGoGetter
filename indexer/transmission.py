@@ -22,7 +22,8 @@ import secrets
 import time
 import urllib.parse
 
-from . import state
+# Avoid circular import when imported by server.py
+import state  # type: ignore  # noqa: E402
 
 SESSION_ID = secrets.token_hex(6)
 SESSIONS: dict[str, float] = {}   # session_id → last_seen (for auth timeout)
@@ -113,7 +114,7 @@ async def _session_get(args: dict) -> dict:
 async def _torrent_add(args: dict) -> dict:
     """Add a download. We don't have real torrent info, so we kick off
     a background download via pipeline.grab and return the assigned id."""
-    from . import pipeline  # avoid circular import
+    import pipeline  # type: ignore  # avoid circular import  # noqa: E402
 
     url = args.get("filename") or args.get("metainfo")
     if not url:
@@ -135,10 +136,8 @@ async def _torrent_add(args: dict) -> dict:
         guid=url,
         url=url,
         title=title,
+        download_dir=dest_dir,
     )
-    # Override the default download_dir with whatever Questarr asked for
-    grab.download_dir = dest_dir
-    state.upsert(grab)
 
     # Return shape that transmission.ts's addDownload expects:
     #   response.arguments["torrent-added"].hashString  OR
