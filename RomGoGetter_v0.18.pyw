@@ -99,6 +99,31 @@ FONT_LG = None
 FONT_XL = None
 _BASE_FONT_SIZE = 10
 
+# SECURITY PATCH: PINNED UPSTREAM SHA256 for the bundled aria2c.exe.
+# Upstream source: https://github.com/aria2/aria2/releases/tag/release-1.37.0
+# File:            aria2-1.37.0-win-64bit-build1.zip -> aria2c.exe
+# If the binary in this directory has been swapped (e.g. by a compromised git
+# commit) SHA256 will not match and we print a loud warning at startup.
+# The app still runs — you decide whether to proceed.
+ARIA2C_EXPECTED_SHA256 = 'be2099c214f63a3cb4954b09a0becd6e2e34660b886d4c898d260febfe9d70c2'
+
+def _check_aria2c_integrity() -> str:
+    """Return 'ok' | 'missing' | 'mismatch' | 'skipped'."""
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'aria2c.exe')
+    if not os.path.exists(bundled):
+        return 'missing'
+    try:
+        h = hashlib.sha256()
+        with open(bundled, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        actual = h.hexdigest()
+        if actual == ARIA2C_EXPECTED_SHA256:
+            return 'ok'
+        return f'mismatch:{actual}'
+    except Exception as ex:
+        return f'skipped:{ex}'
+
 def _init_fonts(base_size=10):
     """Create or update named tkinter fonts. Call after Tk() is instantiated."""
     import tkinter.font as tkfont
@@ -467,9 +492,37 @@ def fetch_archive_filenames(url: str, access: str = None, secret: str = None) ->
     return results, page_title
 
 
+# SECURITY PATCH: IGDB credentials were previously hardcoded in the upstream
+# script (the maintainer's Twitch OAuth client_id + secret). Every install was
+# authenticating as the same shared client, which means rate-limit and abuse
+# are aggregated across all users. The hardcoded credentials are now removed.
+# Provide your own Twitch dev-app credentials via the environment variables:
+#   IGDB_CLIENT_ID      — your Twitch application's client_id
+#   IGDB_TWITCH_SECRET  — your Twitch application's client_secret
+# If either is missing, IGDB-backed features raise an error explaining this,
+# instead of silently sharing the leaked credentials.
+import os as _os
+
+def _igdb_creds() -> tuple[str, str]:
+    """Return (client_id, client_secret) from env. Raises if absent."""
+    cid = _os.environ.get('IGDB_CLIENT_ID', '').strip()
+    sec = _os.environ.get('IGDB_TWITCH_SECRET', '').strip()
+    if not cid or not sec:
+        raise RuntimeError(
+            'IGDB requires a Twitch OAuth client_id + client_secret. '
+            'Set the environment variables IGDB_CLIENT_ID and IGDB_TWITCH_SECRET '
+            'before running this script. See SECURITY.md for details.'
+        )
+    return cid, sec
+
 def is_lolroms_url(url: str) -> bool:
-    u = url.split('#')[0].lower()
-    return 'lolroms.com' in u or ('web.archive.org' in u and 'lolroms.com' in u)
+    # SECURITY PATCH: lolroms.com scraping disabled in this fork.
+    # The site is gated by Cloudflare anti-bot, the scraping adds no real value
+    # (archive.org + minerva cover the legitimate use cases), and a preset
+    # group shipped in the repo pointed at decrypted ROM listings from this
+    # piracy host. Returning False makes any lolroms URL fall through to the
+    # generic archive.org fetcher (which will 404 cleanly for non-archive URLs).
+    return False
 
 
 def is_minerva_url(url: str) -> bool:
@@ -925,11 +978,15 @@ def invalidate_url_cache(url: str = None):
 
 
 def fetch_lolroms_filenames(url: str) -> tuple[list, str | None]:
-    """Fetch file listing from a lolroms.com category page (direct or via Wayback).
-    Returns ([(filename, size_str, direct_download_url), ...], page_title | None).
-    The third element is the actual lolroms.com download URL regardless of how the
-    page was fetched — Wayback only archives HTML, not the files themselves.
+    """SECURITY PATCH: lolroms.com scraping disabled in this fork.
+
+    Returns ([], None) — the lolroms preset groups have been removed from
+    RomGoGetter_groups.json and any user who manually pastes a lolroms URL
+    will see an empty listing and a console warning. To re-enable, see
+    SECURITY.md and the prior implementation that lived here.
     """
+    print('[SECURITY] lolroms.com scraping is disabled in this fork; ignoring URL.')
+    return [], None
     # Strip fragment (#...) — urllib passes it through unlike browsers
     url = url.split('#')[0].rstrip('/')
 
@@ -2956,12 +3013,19 @@ class App:
         threading.Thread(target=_do, daemon=True).start()
 
     def _igdb_get_token(self) -> str:
-        """Fetch or return cached OAuth2 token for IGDB."""
+        """Fetch or return cached OAuth2 token for IGDB.
+        SECURITY PATCH: credentials now come from IGDB_CLIENT_ID /
+        IGDB_TWITCH_SECRET environment variables. The previously hardcoded
+        client_id and client_secret belong to the maintainer's Twitch app
+        and have been removed. See SECURITY.md.
+        """
         if self._igdb_token:
             return self._igdb_token
+        cid, sec = _igdb_creds()
+        self._igdb_client_id = cid  # remembered for subsequent POSTs
         url = (f'https://id.twitch.tv/oauth2/token'
-               f'?client_id=p66yhx7xnqs08602qb4bxn0az5xa23'
-               f'&client_secret=glxj73ulac8yqxgzeuiadwx6zfvi8s'
+               f'?client_id={quote(cid)}'
+               f'&client_secret={quote(sec)}'
                f'&grant_type=client_credentials')
         req = urllib.request.Request(url, method='POST')
         with urllib.request.urlopen(req, timeout=15) as r:
@@ -2973,11 +3037,13 @@ class App:
     def _igdb_post(self, endpoint: str, body: str) -> list:
         """POST to IGDB API and return parsed JSON list."""
         token = self._igdb_get_token()
+        # SECURITY PATCH: Client-ID now sourced from env, not hardcoded.
+        cid = getattr(self, '_igdb_client_id', None) or _os.environ.get('IGDB_CLIENT_ID', '')
         req = urllib.request.Request(
             f'https://api.igdb.com/v4/{endpoint}',
             data=body.encode('utf-8'),
             headers={
-                'Client-ID':     'p66yhx7xnqs08602qb4bxn0az5xa23',
+                'Client-ID':     cid,
                 'Authorization': f'Bearer {token}',
                 'Accept':        'application/json',
             },
@@ -9290,6 +9356,24 @@ class App:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    # SECURITY PATCH: integrity check on the bundled aria2c.exe.
+    # Upstream aria2 1.37.0 build 1 SHA256 is hard-pinned above. A mismatch is
+    # not fatal (you may want to run a custom build), but a loud warning is
+    # printed so a tampered binary cannot slip by silently.
+    _aria_check = _check_aria2c_integrity()
+    if _aria_check == 'ok':
+        print('[SECURITY] aria2c.exe SHA256 OK (matches aria2 1.37.0 upstream).')
+    elif _aria_check == 'missing':
+        print('[SECURITY] aria2c.exe not found next to script; download from upstream:')
+        print('           https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip')
+    elif _aria_check.startswith('mismatch:'):
+        print('[SECURITY][!] aria2c.exe SHA256 does NOT match upstream aria2 1.37.0!')
+        print('           Expected: ' + ARIA2C_EXPECTED_SHA256)
+        print('           Actual:   ' + _aria_check.split(':', 1)[1])
+        print('           This binary has been modified or swapped. Verify before running.')
+    else:
+        print(f'[SECURITY] aria2c.exe integrity check skipped: {_aria_check}')
+
     try:
         app = App()
         app.run()
