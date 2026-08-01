@@ -78,13 +78,19 @@ patch.
 
 ### 3. `aria2c.exe` SHA256 pinned + verified at startup
 
-The upstream repo commits the 5.6 MB `aria2c.exe` Windows binary to `main`.
+For **Windows users** or anyone running the script as-published, the
+upstream repo commits the 5.6 MB `aria2c.exe` Windows binary to `main`.
 That convention is convenient but means a future commit (or a compromised
 GitHub credential) could swap the binary and you'd auto-pull a trojaned
 version with no provenance check.
 
+**For NixOS / Linux users**, this fork provides a `flake.nix` (see *NixOS
+support* below) that pulls `aria2 1.37.0` straight from nixpkgs at run
+time — no bundled binary, no SHA check needed because Nix substitutes only
+against the locked store path.
+
 **In this fork**, `_check_aria2c_integrity()` runs at startup and SHA256s
-the bundled `aria2c.exe` against the upstream `aria2 1.37.0
+the bundled `aria2c.exe` (if present) against the upstream `aria2 1.37.0
 win-64bit build 1` hash:
 
 ```
@@ -104,6 +110,30 @@ defensive — if a future commit changes the binary, you'll see:
 You can decide to keep going or kill the process. Replacing the pinned hash
 with the new value (after you've verified a newer build against upstream) is
 a one-line change in the patched function.
+
+If you delete `aria2c.exe` from the project directory and rely on the Nix
+dev shell (or a system-installed `aria2` on PATH), `find_aria2c()` falls
+back automatically; startup will print `[SECURITY] aria2c.exe not found
+next to script; ...` which is informational, not a failure.
+
+### 4. Nix flake (NixOS / Linux support)
+
+For NixOS users, the fork provides a project-local `flake.nix` that
+provides everything the script needs without ever touching the bundled
+`aria2c.exe`:
+
+```
+nix --extra-experimental-features 'nix-command flakes' develop
+```
+
+This drops you into a shell with `python3` (with `tkinter`, `rapidfuzz`,
+and `cloudscraper` already importable) plus `aria2` from nixpkgs. Then:
+
+```
+python RomGoGetter_v0.18.pyw
+```
+
+You can also `nix run .#default` to launch directly. Repo path: `flake.nix`.
 
 ---
 
@@ -185,19 +215,36 @@ print(h.hexdigest())
 
 ## Running the fork
 
-```bash
-# 1. Register a Twitch dev app
-#    https://dev.twitch.tv/console/apps/create
-#    Name: anything (e.g. "RomGoGetter-personal")
-#    OAuth redirect URL: http://localhost (irrelevant)
-#    Category: Application Integration
+### NixOS / Linux
 
-# 2. Set env vars and launch
+```bash
+cd ~/Projects/RomGoGetter
+nix --extra-experimental-features 'nix-command flakes' develop
+# You are now in a shell with python 3.14, tkinter, rapidfuzz,
+# cloudscraper, and aria2c 1.37.0 on PATH.
+
+# Optional IGDB creds:
 export IGDB_CLIENT_ID=<your_client_id>
 export IGDB_TWITCH_SECRET=<your_client_secret>
-python3 RomGoGetter_v0.18.pyw
 
-# On macOS/Linux, the env vars only persist for that shell session.
-# To persist, put both in ~/.config/romgogetter/env.sh and:
-echo 'source ~/.config/romgogetter/env.sh' >> ~/.bashrc
+python RomGoGetter_v0.18.pyw
 ```
+
+If you have `nix-direnv` installed and enabled, just `cd`-ing into the
+project triggers the same shell via the `.envrc` file.
+
+### macOS / Windows
+
+```bash
+# Optional IGDB creds first (see step 1 above)
+export IGDB_CLIENT_ID=xxx
+export IGDB_TWITCH_SECRET=yyy
+python RomGoGetter_v0.18.pyw
+
+# Required deps:
+#   pip install rapidfuzz cloudscraper  # per upstream README
+```
+
+`aria2c` is bundled on Windows (`aria2c.exe`) and verified at startup.
+On macOS, `brew install aria2` (the SHA check reports `missing` but the
+runtime falls through to the system `aria2c` automatically).
