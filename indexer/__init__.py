@@ -1,0 +1,1 @@
+"""RomGoGetter indexer package."""
