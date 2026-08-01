@@ -18,7 +18,7 @@ import sys
 import urllib.parse
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
 
 # Make the fork's modules importable. The flake.nix wires /app to be the
 # fork root, so rgg.py sits at /app/rgg.py and RomGoGetter_groups.json at /app/.
@@ -138,6 +138,25 @@ async def transmission_session_check(request: Request):
         status_code=409,
         headers={"X-Transmission-Session-Id": transmission.SESSION_ID},
     )
+
+
+@app.get("/torrents/{key}.torrent")
+async def serve_subset_torrent(key: str):
+    """Serve a pre-built single-file subset torrent.
+
+    Questarr's Transmission client downloads the URL, parses the torrent,
+    then forwards it as base64 `metainfo` to the real Transmission daemon.
+    Transmission then BitTorrent-downloads only the matching file.
+    """
+    # Defend against path traversal: key is a 16-char hex from sha256[:16]
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-f]{16}", key):
+        return PlainTextResponse("invalid key", status_code=400)
+    path = pipeline.SUBSET_TORRENT_DIR / f"{key}.torrent"
+    if not path.exists():
+        return PlainTextResponse("not found", status_code=404)
+    return FileResponse(path, media_type="application/x-bittorrent",
+                        filename=f"{key}.torrent")
 
 
 if __name__ == "__main__":

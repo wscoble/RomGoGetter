@@ -111,6 +111,77 @@ def load_groups() -> list[dict]:
 GROUPS: list[dict] = []   # populated by startup_recover()
 
 
+# === Subset torrents (for Minerva groups) ===
+
+SUBSET_TORRENT_DIR = Path(os.environ.get("RGG_DATA_DIR", "/app/data")) / "subtorrents"
+SUBSET_TORRENT_DIR.mkdir(parents=True, exist_ok=True)
+SUBSET_TORRENT_BASE_URL = os.environ.get("RGG_PUBLIC_URL", "").rstrip("/")
+
+
+def _subset_cache_key(browse_url: str, rel_path: str) -> str:
+    """Stable hash for (browse_url, rel_path). Used as filename and URL slug."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(browse_url.encode("utf-8"))
+    h.update(b"\x00")
+    h.update(rel_path.encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def get_or_build_subset_torrent(*, browse_url: str, rel_path: str,
+                                display_name: str, size_bytes: int) -> str | None:
+    """Build (or reuse cached) single-file subset torrent for one Minerva entry.
+
+    Returns the public URL (e.g. "http://host:9696/torrents/<key>.torrent") that
+    Questarr/Transmission can fetch. The torrent contains only the single file
+    matching `rel_path`, with correct piece hashes — so Transmission will
+    download JUST that file via BitTorrent, not the whole collection.
+
+    Args:
+        browse_url: The Minerva browse URL (e.g. .../Redump/Sony - PlayStation 3/).
+        rel_path:   The relative path inside the parent torrent
+                    (e.g. "Redump/Sony - PlayStation 3/Shadow of the Colossus.zip").
+        display_name: Filename shown to the user (basename of rel_path).
+        size_bytes:  Size of the file in bytes (for info / logging).
+
+    Returns:
+        Absolute URL string pointing to the subset torrent, or None on failure.
+    """
+    key = _subset_cache_key(browse_url, rel_path)
+    out_path = SUBSET_TORRENT_DIR / f"{key}.torrent"
+    if out_path.exists():
+        return f"{SUBSET_TORRENT_BASE_URL}/torrents/{key}.torrent"
+
+    # 1. Find the parent torrent URL
+    parent_url = rgg.minerva_torrent_url(browse_url)
+    if not parent_url:
+        print(f"[pipeline] no parent torrent URL for {browse_url}")
+        return None
+
+    # 2. Download the parent torrent (cached locally too — same parent for many files)
+    parent_key = _subset_cache_key(parent_url, "")
+    parent_path = SUBSET_TORRENT_DIR / f"_parent_{parent_key}.torrent"
+    if not parent_path.exists():
+        print(f"[pipeline] downloading parent torrent: {parent_url}")
+        req = urllib.request.Request(parent_url, headers={
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+        })
+        with urllib.request.urlopen(req, timeout=120) as r:
+            parent_data = r.read()
+        parent_path.write_bytes(parent_data)
+
+    # 3. Build subset torrent
+    parent_data = parent_path.read_bytes()
+    # rgg.make_subset_torrent expects a set of filenames; try the rel_path first,
+    # then the basename (rel_path may use full path or just basename inside the torrent).
+    rel_basename = os.path.basename(rel_path)
+    subset_data = rgg.make_subset_torrent(parent_data, {rel_path, rel_basename})
+    out_path.write_bytes(subset_data)
+    print(f"[pipeline] built subset torrent for {display_name}: {len(subset_data):,} bytes")
+
+    return f"{SUBSET_TORRENT_BASE_URL}/torrents/{key}.torrent"
+
+
 # === Listing fetch (with retry) ===
 
 def _is_retryable(exc: Exception) -> bool:
@@ -325,8 +396,46 @@ async def search(query: str) -> list[dict]:
                         size_int = parse_size_bytes(size_str)
                     except Exception:
                         size_int = 0
+                    # For Minerva groups, fetch_minerva_filenames stores the
+                    # relative path *inside* the BitTorrent (e.g.
+                    # "Redump/Sony - PlayStation 3/file.zip"). That path is NOT
+                    # a URL — Questarr/Transmission can't fetch it directly.
+                    #
+                    # Approach: pre-build a SINGLE-FILE subset torrent that
+                    # contains only the matching file, served at
+                    # /torrents/<sha>.torrent. The downloader (Transmission)
+                    # will then download just that one file via BitTorrent.
+                    #
+                    # This is lazy + cached: the first search that needs a
+                    # given (group, file) pair builds the subset torrent; later
+                    # searches reuse it.
+                    if rgg.is_minerva_url(group["listing_url"]):
+                        # Look up the relative path for this match
+                        rel_path = None
+                        for inst in instances:
+                            if inst.get("filename") == best_filename:
+                                rel_path = inst.get("direct_url")
+                                break
+                        if not rel_path:
+                            continue
+                        try:
+                            subset_url = get_or_build_subset_torrent(
+                                browse_url=group["listing_url"],
+                                rel_path=rel_path,
+                                display_name=best_filename,
+                                size_bytes=size_int,
+                            )
+                        except Exception as e:
+                            print(f"[pipeline] subset torrent build failed for {best_filename}: {e}")
+                            continue
+                        if not subset_url:
+                            continue
+                        direct_url = subset_url
+                        entry_title = best_filename
+                    else:
+                        entry_title = best_filename
                     out.append({
-                        "title": best_filename,
+                        "title": entry_title,
                         "guid": best_filename,
                         "link": direct_url,
                         "size": size_int,
