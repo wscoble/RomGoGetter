@@ -434,13 +434,12 @@ async def search(query: str) -> list[dict]:
             # prewarm), fall back to fetching + building on demand.
             candidates = _CANDIDATE_CACHE.get(listing_url)
             if candidates is None:
-                entries, _title = await _fetch_listing(listing_url)
-                if not entries or not isinstance(entries, list):
-                    return []
-                if entries and not isinstance(entries[0], tuple):
-                    return []
-                candidates = _build_candidates(entries)
-                _CANDIDATE_CACHE[listing_url] = candidates
+                # Group hasn't been prewarmed yet. Skip it rather than
+                # falling back to a synchronous fetch+filter, which would block
+                # the search for ~7s/group and blow the 30s Torznab budget.
+                # Prewarm runs in the background and will fill the cache; the
+                # next search will include this group.
+                return []
             if not candidates:
                 return []
             try:
@@ -675,18 +674,35 @@ def startup_recover() -> None:
     # cached, so once we trigger the first fetch for each group, all subsequent
     # searches hit the cache and return in milliseconds. Without this, the
     # FIRST search takes ~30s to fetch all listings sequentially.
+    # Pre-warm all listings IN PARALLEL and precompute candidates.
+    # rgg.fetch_url_cached is in-process cached (per pod lifetime). Each
+    # archive.org listing takes ~6-7s to fetch from the pod; with 190 group
+    # shards that's ~22 min sequential, which makes the first ~20 min of
+    # pod life return partial results. Parallelizing with 8 threads cuts
+    # warmup to ~3 min.
     import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    _PREWARM_WORKERS = 8
+
+    def _prewarm_one(group: dict) -> tuple[str, str]:
+        try:
+            t0 = time.time()
+            entries, _ = rgg.fetch_url_cached(group["listing_url"])
+            cands = _build_candidates(entries)
+            _CANDIDATE_CACHE[group["listing_url"]] = cands
+            dt = time.time() - t0
+            return (f"[pipeline] prewarm {group['name']}: {len(entries)} entries, {len(cands)} candidates in {dt:.2f}s", "")
+        except Exception as e:
+            return ("", f"[pipeline] prewarm failed for {group['name']}: {e}")
+
     def _prewarm_listings():
-        for group in GROUPS:
-            try:
-                t0 = time.time()
-                entries, _ = rgg.fetch_url_cached(group["listing_url"])
-                dt = time.time() - t0
-                # Precompute the query-independent candidate rows NOW so the
-                # first search doesn't pay the _apply_filter cost (0.3-0.4s/group).
-                cands = _build_candidates(entries)
-                _CANDIDATE_CACHE[group["listing_url"]] = cands
-                print(f"[pipeline] prewarm {group['name']}: {len(entries)} entries, {len(cands)} candidates in {dt:.2f}s", flush=True)
-            except Exception as e:
-                print(f"[pipeline] prewarm failed for {group['name']}: {e}", flush=True)
+        with ThreadPoolExecutor(max_workers=_PREWARM_WORKERS) as ex:
+            futures = [ex.submit(_prewarm_one, g) for g in GROUPS]
+            for fut in futures:
+                ok, err = fut.result()
+                if ok:
+                    print(ok, flush=True)
+                if err:
+                    print(err, flush=True)
     threading.Thread(target=_prewarm_listings, daemon=True).start()
