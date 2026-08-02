@@ -208,6 +208,11 @@ async def _torrent_add(args: dict) -> dict:
         return {}
 
     dest_dir = args.get("download-dir", "/mnt/shared/roms")
+    # Questarr sometimes sends a relative download-dir (e.g. "mnt/shared/roms")
+    # which would write files to the container's CWD instead of the hostPath
+    # NAS mount. Coerce to an absolute path so files land on the host.
+    if not str(dest_dir).startswith("/"):
+        dest_dir = "/" + str(dest_dir)
 
     grab = await pipeline.grab(
         indexer_id="transmission-rpc",
