@@ -664,26 +664,33 @@ def startup_recover() -> None:
     # 60s+ timeouts. Doing it eagerly at startup means search responses
     # are fast on the first user query.
     import threading
+    def _prefetch_one(group):
+        url = group["listing_url"]
+        if not rgg.is_minerva_url(url):
+            return
+        parent_url = rgg.minerva_torrent_url(url)
+        if not parent_url:
+            return
+        parent_key = _subset_cache_key(parent_url, "")
+        parent_path = SUBSET_TORRENT_DIR / f"_parent_{parent_key}.torrent"
+        if parent_path.exists():
+            return
+        try:
+            print(f"[pipeline] prefetch parent torrent: {parent_url}", flush=True)
+            req = urllib.request.Request(parent_url, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            })
+            with urllib.request.urlopen(req, timeout=120) as r:
+                parent_path.write_bytes(r.read())
+            print(f"[pipeline] prefetch done: {parent_path}", flush=True)
+        except Exception as e:
+            print(f"[pipeline] prefetch failed for {parent_url}: {e}", flush=True)
     def _prefetch():
+        threads = []
         for group in GROUPS:
-            url = group["listing_url"]
-            if not rgg.is_minerva_url(url):
-                continue
-            parent_url = rgg.minerva_torrent_url(url)
-            if not parent_url:
-                continue
-            parent_key = _subset_cache_key(parent_url, "")
-            parent_path = SUBSET_TORRENT_DIR / f"_parent_{parent_key}.torrent"
-            if parent_path.exists():
-                continue
-            try:
-                print(f"[pipeline] prefetch parent torrent: {parent_url}")
-                req = urllib.request.Request(parent_url, headers={
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-                })
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    parent_path.write_bytes(r.read())
-                print(f"[pipeline] prefetch done: {parent_path}")
-            except Exception as e:
-                print(f"[pipeline] prefetch failed for {parent_url}: {e}")
+            t = threading.Thread(target=_prefetch_one, args=(group,), daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=180)
     threading.Thread(target=_prefetch, daemon=True).start()
