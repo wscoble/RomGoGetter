@@ -97,12 +97,30 @@ async def torznab_endpoint(request: Request):
             )
 
         items = await pipeline.search(query)
-        # Apply cat filter if requested
+        # Apply cat filter if requested. Torznab category matching: a requested
+        # cat like "1000" (Console) is a PARENT and matches any sub-category
+        # 10xx; "4000" (PC) matches 4xxx. A specific sub-cat (e.g. "1020")
+        # matches only itself. An item with multiple cats ("1020,1021") matches
+        # if ANY of them matches ANY requested cat.
         if cat:
-            wanted_cats = set(c for c in cat.split(",") if c)
+            req_cats = [c.strip() for c in cat.split(",") if c.strip()]
+            def _cat_matches(req: str, item_cat: str) -> bool:
+                if item_cat == req:
+                    return True
+                # parent match: req ends with "000" -> matches any cat
+                # sharing its leading digit(s).
+                if req.endswith("000"):
+                    prefix = req[:-3]
+                    return bool(prefix) and item_cat.startswith(prefix)
+                return False
             items = [
                 it for it in items
-                if any(c.split(",")[0] == cat.split(",")[0] for c in it.get("category", "").split(","))
+                if any(
+                    _cat_matches(r, ic)
+                    for r in req_cats
+                    for ic in str(it.get("category", "")).split(",")
+                    if ic
+                )
             ]
         items = items[offset:offset + limit]
 
