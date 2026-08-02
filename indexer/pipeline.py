@@ -617,6 +617,9 @@ def _do_download(gid: str) -> None:
     except Exception as e:
         grab.status = 0        # stopped/failed
         grab.error_string = str(e)[:512]
+        import traceback as _tb
+        print(f"[pipeline] download FAILED for {grab.title} ({grab.url}): {e}", flush=True)
+        print(f"  {_tb.format_exc().strip()}", flush=True)
     finally:
         state.upsert(grab)
 
