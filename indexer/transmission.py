@@ -25,6 +25,64 @@ import urllib.parse
 # Avoid circular import when imported by server.py
 import state  # type: ignore  # noqa: E402
 
+
+def _recover_real_url(raw: str) -> str | None:
+    """Recover the real archive.org URL from a torrent-add filename/metainfo.
+
+    Handles three forms Questarr can hand us:
+      1. A direct archive.org URL (rare - Questarr usually rewrites the host):
+         https://archive.org/download/<id>/<file>
+      2. A self-referential URL pointing at our /dl/<key> endpoint (after the
+         /dl/ fix): http://<us>/dl/<key> -> look up _DL_MAP.
+      3. A legacy self-referential URL pointing at /download/<path> (pre-fix,
+         when Questarr rewrote archive.org host to our host):
+         http://<us>/download/<id>/<file> -> reconstruct archive.org.
+    """
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Form 1: already a real external URL
+    parsed = urllib.parse.urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host and host not in ("", ) and not _is_self_host(host):
+        return raw
+    # Form 2: /dl/<key>
+    m = _re.search(r"/dl/([0-9a-f]{16})", raw)
+    if m:
+        import pipeline  # type: ignore  # noqa: E402
+        entry = pipeline.dl_lookup(m.group(1))
+        return entry["url"] if entry else None
+    # Form 3: /download/<path> -> https://archive.org/download/<path>
+    m = _re.search(r"/download/(.+)$", raw)
+    if m:
+        path = m.group(1)
+        # Strip any query string the client may have appended
+        path = path.split("?")[0]
+        return f"https://archive.org/download/{path}"
+    return None
+
+
+def _is_self_host(host: str) -> bool:
+    """True if <host> is our own advertised public host."""
+    import os
+    pub = os.environ.get("RGG_PUBLIC_URL", "")
+    pub_host = urllib.parse.urlparse(pub).hostname or ""
+    return bool(pub_host) and host.lower() == pub_host.lower()
+
+
+import re as _re  # noqa: E402
+
+# rgg provides bdecode/bencode for parsing metainfo .torrent blobs.
+import sys as _sys, os as _os  # noqa: E402
+_app_root = _os.environ.get("RGG_APP_ROOT", "/app")
+if _app_root not in _sys.path:
+    _sys.path.insert(0, _app_root)
+try:
+    import rgg  # type: ignore  # noqa: E402
+except Exception:
+    rgg = None  # type: ignore
+
+
 SESSION_ID = secrets.token_hex(6)
 SESSIONS: dict[str, float] = {}   # session_id → last_seen (for auth timeout)
 
@@ -116,25 +174,46 @@ async def _torrent_add(args: dict) -> dict:
     a background download via pipeline.grab and return the assigned id."""
     import pipeline  # type: ignore  # avoid circular import  # noqa: E402
 
-    url = args.get("filename") or args.get("metainfo")
-    if not url:
-        # No URL — Questarr requires filename or metainfo
-        return {}
+    # Questarr fetches our /dl/<key> .torrent, parse-torrents it, and POSTs
+    # it here as base64 `metainfo`. The .torrent's `comment` field carries the
+    # real archive.org URL. Fallback: `filename` may be our own /dl/<key> URL
+    # (if Questarr's fetch failed and it passed the URL through directly) or a
+    # raw archive.org URL (if Questarr didn't rewrite the host). Recover the
+    # real URL in all three cases.
+    import base64 as _b64, re as _re  # noqa: E402
+    real_url = None
+    title = (args.get("labels") or [""])[0] or "download"
+
     if args.get("metainfo"):
-        # metainfo is base64 of a .torrent file. The fork script doesn't consume
-        # .torrent files (only HTTP listings), so we'd need a workaround.
-        # For now: refuse and tell Questarr to use filename instead.
-        # (Questarr's transmission.ts tries URL fetch first if filename is HTTP.)
+        try:
+            tdata = _b64.b64decode(args["metainfo"])
+            decoded = rgg.bdecode(tdata)
+            if isinstance(decoded, tuple):
+                decoded = decoded[0]
+            if decoded and b"comment" in decoded:
+                real_url = decoded[b"comment"].decode("utf-8", "replace")
+            # filename inside the torrent is the best display title
+            info = decoded.get(b"info", {}) if decoded else {}
+            if isinstance(info, dict) and b"name" in info:
+                title = info[b"name"].decode("utf-8", "replace")
+        except Exception as e:
+            print(f"[transmission] metainfo decode failed: {e}")
+    if not real_url:
+        raw = args.get("filename") or args.get("metainfo")
+        if not raw:
+            return {}
+        real_url = _recover_real_url(raw)
+    if not real_url:
+        print(f"[transmission] could not recover real URL from torrent-add args: {args}")
         return {}
 
-    title = (args.get("labels") or ["unknown"])[0]
     dest_dir = args.get("download-dir", "/mnt/shared/roms")
 
     grab = await pipeline.grab(
         indexer_id="transmission-rpc",
         indexer_name="RomGoGetter",
-        guid=url,
-        url=url,
+        guid=real_url,
+        url=real_url,
         title=title,
         download_dir=dest_dir,
     )

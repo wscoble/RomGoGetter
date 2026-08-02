@@ -177,6 +177,30 @@ async def serve_subset_torrent(key: str):
                         filename=f"{key}.torrent")
 
 
+@app.get("/dl/{key}")
+async def serve_dl_torrent(key: str):
+    """Serve a minimal single-file .torrent for a download key.
+
+    Questarr's Transmission client fetches this URL, parse-torrents the
+    result, base64s it, and POSTs it as `metainfo` to our /transmission/rpc.
+    The torrent's `comment` field carries the real archive.org URL so our
+    Transmission emulator can run the actual HTTP download. The .torrent is
+    tiny (a few hundred bytes) regardless of the real file size, so Questarr
+    never buffers a multi-GB ROM in memory.
+    """
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-f]{16}", key):
+        return PlainTextResponse("invalid key", status_code=400)
+    data = pipeline.dl_build_torrent(key)
+    if data is None:
+        return PlainTextResponse("not found", status_code=404)
+    return Response(
+        content=data,
+        media_type="application/x-bittorrent",
+        headers={"Content-Disposition": f'attachment; filename="{key}.torrent"'},
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
     # Single uvicorn worker — keeps parent torrent prefetch / listing prewarm

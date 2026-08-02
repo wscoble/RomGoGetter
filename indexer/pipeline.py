@@ -363,6 +363,56 @@ class _StubApp(rgg.App):
 # time we only score cached rows against the query (pure string matching).
 _CANDIDATE_CACHE: dict[str, list[dict]] = {}
 
+# Download-key map. Questarr rewrites any torznab <link> whose host differs
+# from the configured indexer URL to point at the indexer host (Prowlarr-style
+# proxying). archive.org links become http://<us>/download/<id>/<file> and
+# 404. So we expose every file via our OWN /dl/<key> endpoint (same host as
+# the indexer -> Questarr leaves it alone) and remember the real archive.org
+# URL behind the key. Questarr fetches /dl/<key>, we return a tiny .torrent
+# whose `comment` carries the real URL; Questarr base64s it and POSTs it as
+# `metainfo`; our Transmission handler reads the comment and runs the real
+# HTTP download (aria2c/urllib) to the NAS.
+_DL_MAP: dict[str, dict] = {}
+
+
+def _register_dl(real_url: str, filename: str, size: int) -> str:
+    """Register a real download URL behind a short key; return the key."""
+    import hashlib
+    key = hashlib.sha256(real_url.encode("utf-8", "replace")).hexdigest()[:16]
+    _DL_MAP[key] = {"url": real_url, "filename": filename, "size": int(size or 0)}
+    return key
+
+
+def dl_lookup(key: str) -> dict | None:
+    return _DL_MAP.get(key)
+
+
+def dl_build_torrent(key: str) -> bytes | None:
+    """Build a minimal parseable single-file .torrent for <key>.
+
+    Not a real BitTorrent: it carries the real archive.org URL in its
+    `comment` field so our Transmission emulator can recover it. The
+    parse-torrent npm lib only needs a valid bencoded `info` dict.
+    """
+    entry = _DL_MAP.get(key)
+    if not entry:
+        return None
+    name = entry["filename"].encode("utf-8", "replace")
+    length = max(int(entry.get("size") or 0), 1)
+    info = {
+        b"name": name,
+        b"length": length,
+        b"piece length": length,
+        b"pieces": b"\x00" * 20,
+    }
+    torrent = {
+        b"info": info,
+        b"comment": entry["url"].encode("utf-8", "replace"),
+        b"created by": b"RomGoGetter indexer",
+        b"encoding": b"UTF-8",
+    }
+    return rgg.bencode(torrent)
+
 
 def _build_candidates(entries: list) -> list[dict]:
     """Run the query-independent filtering once and return candidate rows.
@@ -455,10 +505,15 @@ async def search(query: str) -> list[dict]:
                     # too slow). Skip any Minerva-sourced entry entirely.
                     if rgg.is_minerva_url(listing_url):
                         continue
+                    # Expose the download through our own /dl/<key> endpoint so
+                    # Questarr doesn't rewrite the archive.org host away (see
+                    # _DL_MAP docs above).
+                    dl_key = _register_dl(direct_url, best_filename, size_int)
+                    dl_url = f"{SUBSET_TORRENT_BASE_URL}/dl/{dl_key}"
                     out.append({
                         "title": best_filename,
                         "guid": best_filename,
-                        "link": direct_url,
+                        "link": dl_url,
                         "size": size_int,
                         "pubDate": "",
                         "category": group["category"],
