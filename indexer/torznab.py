@@ -88,10 +88,20 @@ def items_xml(items: list[dict], total: int | None = None) -> str:
             enclosure.set("url", item["link"])
             enclosure.set("length", str(size))
             enclosure.set("type", "application/zip")
-        # Torznab attrs (mirrors Prowlarr's output)
+        # Torznab attrs (mirrors Prowlarr's output).
+        # archive.org hosts the file and serves it reliably over HTTP, so we
+        # advertise seeders=1 / leechers=0. Questarr sorts its “Download” page
+        # by seeders (desc) and drops results that have no seeders attr at
+        # all, so omitting it hides every RomGoGetter hit behind whatever the
+        # other indexers return.
         for name, val in [
             ("size", str(size)),
             ("category", item.get("category", "5000")),
+            ("seeders", "1"),
+            ("peers", "0"),
+            ("leechers", "0"),
+            ("downloadvolumefactor", "1"),
+            ("uploadvolumefactor", "1"),
         ]:
             a = ET.SubElement(i, "torznab:attr")
             a.set("name", name)
