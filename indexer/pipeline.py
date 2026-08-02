@@ -158,26 +158,32 @@ def get_or_build_subset_torrent(*, browse_url: str, rel_path: str,
         print(f"[pipeline] no parent torrent URL for {browse_url}")
         return None
 
-    # 2. Download the parent torrent (cached locally too — same parent for many files)
+    # 2. Download the parent torrent (cached locally too — same parent for many files).
+    # If prefetch already populated it, this is a fast no-op.
     parent_key = _subset_cache_key(parent_url, "")
     parent_path = SUBSET_TORRENT_DIR / f"_parent_{parent_key}.torrent"
     if not parent_path.exists():
-        print(f"[pipeline] downloading parent torrent: {parent_url}")
-        req = urllib.request.Request(parent_url, headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-        })
-        with urllib.request.urlopen(req, timeout=120) as r:
-            parent_data = r.read()
-        parent_path.write_bytes(parent_data)
+        print(f"[pipeline] downloading parent torrent: {parent_url}", flush=True)
+        try:
+            req = urllib.request.Request(parent_url, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            })
+            with urllib.request.urlopen(req, timeout=30) as r:
+                parent_data = r.read()
+            parent_path.write_bytes(parent_data)
+        except Exception as e:
+            print(f"[pipeline] parent torrent download failed: {e}")
+            return None
+    else:
+        parent_data = parent_path.read_bytes()
 
     # 3. Build subset torrent
-    parent_data = parent_path.read_bytes()
     # rgg.make_subset_torrent expects a set of filenames; try the rel_path first,
     # then the basename (rel_path may use full path or just basename inside the torrent).
     rel_basename = os.path.basename(rel_path)
     subset_data = rgg.make_subset_torrent(parent_data, {rel_path, rel_basename})
     out_path.write_bytes(subset_data)
-    print(f"[pipeline] built subset torrent for {display_name}: {len(subset_data):,} bytes")
+    print(f"[pipeline] built subset torrent for {display_name}: {len(subset_data):,} bytes", flush=True)
 
     return f"{SUBSET_TORRENT_BASE_URL}/torrents/{key}.torrent"
 
@@ -418,6 +424,10 @@ async def search(query: str) -> list[dict]:
                                 break
                         if not rel_path:
                             continue
+                        # Build the subset torrent synchronously. Parent torrents are
+                        # pre-fetched at startup (see startup_recover), so the only
+                        # blocking work is the in-memory subset creation (fast for
+                        # a single file).
                         try:
                             subset_url = get_or_build_subset_torrent(
                                 browse_url=group["listing_url"],
@@ -648,3 +658,32 @@ def startup_recover() -> None:
         print(f"[pipeline] startup recovery: marked {recovered} in-flight grab(s) as FAILED")
     else:
         print(f"[pipeline] startup recovery: no in-flight grabs")
+
+    # Pre-fetch parent torrents for Minerva groups in background.
+    # Each parent is 12–14 MB; downloading them in the search path causes
+    # 60s+ timeouts. Doing it eagerly at startup means search responses
+    # are fast on the first user query.
+    import threading
+    def _prefetch():
+        for group in GROUPS:
+            url = group["listing_url"]
+            if not rgg.is_minerva_url(url):
+                continue
+            parent_url = rgg.minerva_torrent_url(url)
+            if not parent_url:
+                continue
+            parent_key = _subset_cache_key(parent_url, "")
+            parent_path = SUBSET_TORRENT_DIR / f"_parent_{parent_key}.torrent"
+            if parent_path.exists():
+                continue
+            try:
+                print(f"[pipeline] prefetch parent torrent: {parent_url}")
+                req = urllib.request.Request(parent_url, headers={
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+                })
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    parent_path.write_bytes(r.read())
+                print(f"[pipeline] prefetch done: {parent_path}")
+            except Exception as e:
+                print(f"[pipeline] prefetch failed for {parent_url}: {e}")
+    threading.Thread(target=_prefetch, daemon=True).start()
