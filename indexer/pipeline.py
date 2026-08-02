@@ -82,8 +82,10 @@ def _category_for(group_name: str) -> str:
 def load_groups() -> list[dict]:
     """Load preset groups from RomGoGetter_groups.json at /app/RomGoGetter_groups.json.
 
-    Each group has multiple URLs (sometimes sharded A/B/C). We take the first
-    URL of each group as the listing URL.
+    Each group entry can have multiple URLs (sharded A/B/C, or 1G1R archives
+    split by letter). We create one group entry PER URL so the search
+    handler iterates every shard — otherwise we'd miss games whose title
+    starts with a letter that's not in the first shard.
     """
     groups_path = Path(_APP_ROOT) / "RomGoGetter_groups.json"
     if not groups_path.exists():
@@ -98,13 +100,22 @@ def load_groups() -> list[dict]:
         urls = [u.strip() for u in urls_text.strip().splitlines() if u.strip()]
         if not urls:
             continue
-        groups.append({
-            "name": name,
-            "listing_url": urls[0],   # first shard only for now
-            "all_urls": urls,
-            "category": _category_for(name),
-        })
-    print(f"[pipeline] loaded {len(groups)} groups from {groups_path}")
+        # One group entry per URL. The category is the same for all shards
+        # of a logical group (e.g. all PS2 archive.org shards are PS2).
+        cat = _category_for(name)
+        for shard_idx, url in enumerate(urls):
+            # Skip the known-broken TeknoParrot Archive shard (HTTP 404).
+            # The other TeknoParrot shards work.
+            if 'tp-roms_0/TeknoParrot/' in url:
+                continue
+            shard_name = name if len(urls) == 1 else f"{name} #{shard_idx + 1}"
+            groups.append({
+                "name": shard_name,
+                "listing_url": url,
+                "all_urls": urls,
+                "category": cat,
+            })
+    print(f"[pipeline] loaded {len(groups)} group shards from {groups_path}")
     return groups
 
 
