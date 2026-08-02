@@ -161,4 +161,9 @@ async def serve_subset_torrent(key: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("RGG_PORT", "9696")))
+    # workers > 1 means each worker has its own in-process caches (listings,
+    # parent torrents). A single search takes 10-30s on cold start; we don't
+    # want to block health probes while serving.
+    n_workers = int(os.environ.get("RGG_UVICORN_WORKERS", "2"))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("RGG_PORT", "9696")),
+                workers=n_workers)
