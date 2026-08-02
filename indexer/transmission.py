@@ -122,6 +122,14 @@ async def handle(request_body: bytes, headers: dict) -> tuple[int, dict, dict]:
     method = req.get("method", "")
     args = req.get("arguments", {}) or {}
     req_id = req.get("tag") or req.get("id")
+    # Diagnostic: log every RPC method + key args so Questarr's download flow
+    # is observable. Redact metainfo (base64 blob) to a length.
+    if method == "torrent-add":
+        _mi = args.get("metainfo")
+        _fn = args.get("filename")
+        print(f"[transmission] torrent-add metainfo={'<'+str(len(_mi))+'b>' if _mi else None} "
+              f"filename={(_fn[:80] + '...') if _fn else None} "
+              f"download-dir={args.get('download-dir')} labels={args.get('labels')}")
 
     # Auth check
     ok, session_id = _check_session(headers)
@@ -201,11 +209,13 @@ async def _torrent_add(args: dict) -> dict:
     if not real_url:
         raw = args.get("filename") or args.get("metainfo")
         if not raw:
+            print("[transmission] torrent-add: no metainfo and no filename -> rejecting")
             return {}
         real_url = _recover_real_url(raw)
     if not real_url:
-        print(f"[transmission] could not recover real URL from torrent-add args: {args}")
+        print(f"[transmission] could not recover real URL; filename={args.get('filename')!r}")
         return {}
+    print(f"[transmission] torrent-add recovered real_url={real_url} title={title!r}")
 
     dest_dir = args.get("download-dir", "/mnt/shared/roms")
     # Questarr sometimes sends a relative download-dir (e.g. "mnt/shared/roms")
