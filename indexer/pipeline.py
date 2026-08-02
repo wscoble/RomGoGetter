@@ -420,32 +420,11 @@ async def search(query: str) -> list[dict]:
                     # given (group, file) pair builds the subset torrent; later
                     # searches reuse it.
                     if rgg.is_minerva_url(group["listing_url"]):
-                        # Look up the relative path for this match
-                        rel_path = None
-                        for inst in instances:
-                            if inst.get("filename") == best_filename:
-                                rel_path = inst.get("direct_url")
-                                break
-                        if not rel_path:
-                            continue
-                        # Build the subset torrent synchronously. Parent torrents are
-                        # pre-fetched at startup (see startup_recover), so the only
-                        # blocking work is the in-memory subset creation (fast for
-                        # a single file).
-                        try:
-                            subset_url = get_or_build_subset_torrent(
-                                browse_url=group["listing_url"],
-                                rel_path=rel_path,
-                                display_name=best_filename,
-                                size_bytes=size_int,
-                            )
-                        except Exception as e:
-                            print(f"[pipeline] subset torrent build failed for {best_filename}: {e}")
-                            continue
-                        if not subset_url:
-                            continue
-                        direct_url = subset_url
-                        entry_title = best_filename
+                        # Minerva groups are disabled in this fork (their parent
+                        # torrents are 13–23 MB each and downloads from
+                        # minerva-archive.org are too slow for a Torznab search
+                        # response time). Skip these entries entirely.
+                        continue
                     else:
                         entry_title = best_filename
                     out.append({
@@ -663,45 +642,11 @@ def startup_recover() -> None:
     else:
         print(f"[pipeline] startup recovery: no in-flight grabs")
 
-    # Pre-fetch parent torrents for Minerva groups in background.
-    # Each parent is 12–14 MB; downloading them in the search path causes
-    # 60s+ timeouts. Doing it eagerly at startup means search responses
-    # are fast on the first user query.
-    import threading
-    def _prefetch_one(group):
-        url = group["listing_url"]
-        if not rgg.is_minerva_url(url):
-            return
-        parent_url = rgg.minerva_torrent_url(url)
-        if not parent_url:
-            return
-        parent_key = _subset_cache_key(parent_url, "")
-        parent_path = SUBSET_TORRENT_DIR / f"_parent_{parent_key}.torrent"
-        if parent_path.exists():
-            return
-        try:
-            print(f"[pipeline] prefetch parent torrent: {parent_url}", flush=True)
-            req = urllib.request.Request(parent_url, headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
-            })
-            with urllib.request.urlopen(req, timeout=120) as r:
-                parent_path.write_bytes(r.read())
-            print(f"[pipeline] prefetch done: {parent_path}", flush=True)
-        except Exception as e:
-            print(f"[pipeline] prefetch failed for {parent_url}: {e}", flush=True)
-    def _prefetch():
-        threads = []
-        for group in GROUPS:
-            t = threading.Thread(target=_prefetch_one, args=(group,), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join(timeout=180)
-
-    # Also pre-warm all listings in parallel. rgg.fetch_url_cached is in-process
+    # Pre-warm all listings in parallel. rgg.fetch_url_cached is in-process
     # cached, so once we trigger the first fetch for each group, all subsequent
     # searches hit the cache and return in milliseconds. Without this, the
     # FIRST search takes ~30s to fetch all listings sequentially.
+    import threading
     def _prewarm_listings():
         for group in GROUPS:
             try:
@@ -711,9 +656,4 @@ def startup_recover() -> None:
                 print(f"[pipeline] prewarm {group['name']}: {len(entries)} entries in {dt:.2f}s", flush=True)
             except Exception as e:
                 print(f"[pipeline] prewarm failed for {group['name']}: {e}", flush=True)
-
-    # Run parent torrent prefetch and listing prewarm in parallel
-    t1 = threading.Thread(target=_prefetch, daemon=True)
-    t2 = threading.Thread(target=_prewarm_listings, daemon=True)
-    t1.start()
-    t2.start()
+    threading.Thread(target=_prewarm_listings, daemon=True).start()
