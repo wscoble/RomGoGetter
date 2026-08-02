@@ -161,9 +161,18 @@ async def serve_subset_torrent(key: str):
 
 if __name__ == "__main__":
     import uvicorn
-    # workers > 1 means each worker has its own in-process caches (listings,
-    # parent torrents). A single search takes 10-30s on cold start; we don't
-    # want to block health probes while serving.
-    n_workers = int(os.environ.get("RGG_UVICORN_WORKERS", "2"))
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("RGG_PORT", "9696")),
-                workers=n_workers)
+    # Single uvicorn worker — keeps parent torrent prefetch / listing prewarm
+    # state shared in-process. The probe is sized so it doesn't fail during
+    # long searches. Increase RGG_UVICORN_WORKERS only if Questarr hammers
+    # the indexer hard enough to cause probe timeouts.
+    n_workers = int(os.environ.get("RGG_UVICORN_WORKERS", "1"))
+    if n_workers > 1:
+        # Pass app as import string so uvicorn can fork workers. When called via
+        # `python -m indexer.server`, the module is importable as 'indexer.server'.
+        uvicorn.run("indexer.server:app", host="0.0.0.0",
+                    port=int(os.environ.get("RGG_PORT", "9696")),
+                    workers=n_workers,
+                    factory=False)
+    else:
+        uvicorn.run(app, host="0.0.0.0",
+                    port=int(os.environ.get("RGG_PORT", "9696")))
