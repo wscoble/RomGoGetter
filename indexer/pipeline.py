@@ -577,12 +577,19 @@ async def grab(*, indexer_id: str, indexer_name: str, guid: str, url: str,
 
 
 def _safe_dirname(s: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9._/-]+", "_", s).strip("/_")
-    if not s:
-        return "unknown"
-    # No parent refs
+    """Sanitize a download directory path.
+
+    Preserves absolute paths (leading slash) so a download-dir like
+    '/mnt/shared/roms' stays absolute and lands on the host mount instead of
+    the container CWD. Drops '..'/'.' components to block traversal.
+    """
+    is_abs = s.startswith("/")
+    s = re.sub(r"[^A-Za-z0-9._/-]+", "_", s)
     parts = [p for p in s.split("/") if p and p not in ("..", ".")]
-    return "/".join(parts) or "unknown"
+    out = "/".join(parts)
+    if not out:
+        return "/mnt/shared/roms" if is_abs else "unknown"
+    return ("/" + out) if is_abs else out
 
 
 def _safe_filename(s: str) -> str:
