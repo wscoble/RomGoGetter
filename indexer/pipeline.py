@@ -353,6 +353,65 @@ class _StubApp(rgg.App):
         return _NoRoot()
 
 
+# === Candidate precompute (query-independent) ===
+#
+# _apply_filter is the expensive CPU-bound step (~0.3-0.4s per group) and
+# does NOT depend on the search query. With 190 group shards that's ~70s of
+# work on a single uvicorn worker — which blocks the event loop and kills
+# health probes. So we run it ONCE per group at prewarm time, cache the
+# resulting "candidate rows" (title, filename, url, size), and at search
+# time we only score cached rows against the query (pure string matching).
+_CANDIDATE_CACHE: dict[str, list[dict]] = {}
+
+
+def _build_candidates(entries: list) -> list[dict]:
+    """Run the query-independent filtering once and return candidate rows.
+
+    Each row: {title, best_filename, direct_url, size_int}
+    `title` is the normalized title from _apply_filter (no region/edition markers).
+    """
+    try:
+        app = _StubApp(entries)
+        rom_dict, _summary = app._apply_filter(entries, "1G1R English only")
+    except Exception as e:
+        print(f"[pipeline] _apply_filter failed: {e}")
+        return []
+    try:
+        from rgg import parse_size_bytes  # type: ignore  # noqa: E402
+    except Exception:
+        parse_size_bytes = lambda s: 0  # noqa: E731
+    out: list[dict] = []
+    for title, variants_dict in rom_dict.items():
+        if not isinstance(variants_dict, dict):
+            continue
+        instances = variants_dict.get("instances") or []
+        if not instances:
+            continue
+        best = rgg.select_best(instances) or {}
+        best_filename = best.get("filename")
+        if not best_filename:
+            continue
+        direct_url = None
+        for inst in instances:
+            if inst.get("filename") == best_filename:
+                direct_url = inst.get("direct_url")
+                break
+        if not direct_url:
+            continue
+        size_str = best.get("size", "0") or "0"
+        try:
+            size_int = parse_size_bytes(size_str)
+        except Exception:
+            size_int = 0
+        out.append({
+            "title": title,
+            "best_filename": best_filename,
+            "direct_url": direct_url,
+            "size_int": size_int,
+        })
+    return out
+
+
 async def search(query: str) -> list[dict]:
     """Search across all loaded groups for ROMs matching `query`.
 
@@ -368,78 +427,37 @@ async def search(query: str) -> list[dict]:
 
     async def _search_group(group: dict) -> list[dict]:
         async with sem:
-            entries, _title = await _fetch_listing(group["listing_url"])
-            if not entries:
-                return []
-            # Sanity check: entries should be a list of 3-tuples
-            if not isinstance(entries, list):
-                return []
-            if entries and not isinstance(entries[0], tuple):
+            listing_url = group["listing_url"]
+            # Use the precomputed candidate cache if available (populated at
+            # prewarm). This avoids the ~0.4s/group _apply_filter cost on
+            # every search. On a cache miss (e.g. a group that failed to
+            # prewarm), fall back to fetching + building on demand.
+            candidates = _CANDIDATE_CACHE.get(listing_url)
+            if candidates is None:
+                entries, _title = await _fetch_listing(listing_url)
+                if not entries or not isinstance(entries, list):
+                    return []
+                if entries and not isinstance(entries[0], tuple):
+                    return []
+                candidates = _build_candidates(entries)
+                _CANDIDATE_CACHE[listing_url] = candidates
+            if not candidates:
                 return []
             try:
-                app = _StubApp(entries)
-                rom_dict, _summary = app._apply_filter(entries, "1G1R English only")
-            except Exception as e:
-                print(f"[pipeline] _apply_filter failed for {group['name']}: {e}")
-                return []
-            try:
-                from rgg import parse_size_bytes  # type: ignore  # noqa: E402
                 out: list[dict] = []
-                for title, variants_dict in rom_dict.items():
-                    # rom_dict structure from _apply_filter is:
-                    #   {title: {'selected': ..., 'instances': [list of dicts]}}
-                    # `title` here is the already-normalized title from
-                    # _apply_filter (clean: no (USA), no edition markers).
-                    if not isinstance(variants_dict, dict):
-                        continue
-                    instances = variants_dict.get("instances") or []
-                    if not instances:
-                        continue
-                    best = rgg.select_best(instances) or {}
-                    # rgg.select_best returns {'filename', 'size'} only — direct_url
-                    # is NOT included. Look it up from the original instance list.
-                    direct_url = None
-                    best_filename = best.get("filename")
-                    if best_filename:
-                        for inst in instances:
-                            if inst.get("filename") == best_filename:
-                                direct_url = inst.get("direct_url")
-                                break
-                    if not direct_url:
-                        continue
-                    sc = _score(title, query)
+                for row in candidates:
+                    best_filename = row["best_filename"]
+                    direct_url = row["direct_url"]
+                    size_int = row["size_int"]
+                    sc = _score(row["title"], query)
                     if sc < MIN_SCORE_THRESHOLD:
                         continue
-                    # best["size"] from select_best is a human-readable string like '244.1M'.
-                    # Parse to bytes; fall back to 0 if unparseable.
-                    size_str = best.get("size", "0") or "0"
-                    try:
-                        size_int = parse_size_bytes(size_str)
-                    except Exception:
-                        size_int = 0
-                    # For Minerva groups, fetch_minerva_filenames stores the
-                    # relative path *inside* the BitTorrent (e.g.
-                    # "Redump/Sony - PlayStation 3/file.zip"). That path is NOT
-                    # a URL — Questarr/Transmission can't fetch it directly.
-                    #
-                    # Approach: pre-build a SINGLE-FILE subset torrent that
-                    # contains only the matching file, served at
-                    # /torrents/<sha>.torrent. The downloader (Transmission)
-                    # will then download just that one file via BitTorrent.
-                    #
-                    # This is lazy + cached: the first search that needs a
-                    # given (group, file) pair builds the subset torrent; later
-                    # searches reuse it.
-                    if rgg.is_minerva_url(group["listing_url"]):
-                        # Minerva groups are disabled in this fork (their parent
-                        # torrents are 13–23 MB each and downloads from
-                        # minerva-archive.org are too slow for a Torznab search
-                        # response time). Skip these entries entirely.
+                    # Minerva groups are disabled in this fork (parent torrents
+                    # too slow). Skip any Minerva-sourced entry entirely.
+                    if rgg.is_minerva_url(listing_url):
                         continue
-                    else:
-                        entry_title = best_filename
                     out.append({
-                        "title": entry_title,
+                        "title": best_filename,
                         "guid": best_filename,
                         "link": direct_url,
                         "size": size_int,
@@ -451,7 +469,7 @@ async def search(query: str) -> list[dict]:
                 out.sort(key=lambda x: -x["score"])
                 return out[:MAX_RESULTS_PER_GROUP]
             except Exception as e:
-                print(f"[pipeline] post-filter failed for {group['name']}: {e}")
+                print(f"[pipeline] scoring failed for {group['name']}: {e}")
                 return []
 
     group_results = await asyncio.gather(
@@ -664,7 +682,11 @@ def startup_recover() -> None:
                 t0 = time.time()
                 entries, _ = rgg.fetch_url_cached(group["listing_url"])
                 dt = time.time() - t0
-                print(f"[pipeline] prewarm {group['name']}: {len(entries)} entries in {dt:.2f}s", flush=True)
+                # Precompute the query-independent candidate rows NOW so the
+                # first search doesn't pay the _apply_filter cost (0.3-0.4s/group).
+                cands = _build_candidates(entries)
+                _CANDIDATE_CACHE[group["listing_url"]] = cands
+                print(f"[pipeline] prewarm {group['name']}: {len(entries)} entries, {len(cands)} candidates in {dt:.2f}s", flush=True)
             except Exception as e:
                 print(f"[pipeline] prewarm failed for {group['name']}: {e}", flush=True)
     threading.Thread(target=_prewarm_listings, daemon=True).start()
