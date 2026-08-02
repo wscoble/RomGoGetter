@@ -199,7 +199,11 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 def _fetch_listing_sync(url: str) -> tuple[list, str | None]:
-    """Fetch + parse a listing URL using the fork's logic. Retries on transient errors."""
+    """Fetch + parse a listing URL using the fork's logic. Retries on transient errors.
+
+    rgg.fetch_url_cached is in-process cached (per pod lifetime), so once
+    a listing is fetched it's reused for the rest of the pod's life.
+    """
     last_err = None
     for attempt in range(1, MAX_LISTING_RETRIES + 1):
         try:
@@ -693,4 +697,23 @@ def startup_recover() -> None:
             threads.append(t)
         for t in threads:
             t.join(timeout=180)
-    threading.Thread(target=_prefetch, daemon=True).start()
+
+    # Also pre-warm all listings in parallel. rgg.fetch_url_cached is in-process
+    # cached, so once we trigger the first fetch for each group, all subsequent
+    # searches hit the cache and return in milliseconds. Without this, the
+    # FIRST search takes ~30s to fetch all listings sequentially.
+    def _prewarm_listings():
+        for group in GROUPS:
+            try:
+                t0 = time.time()
+                entries, _ = rgg.fetch_url_cached(group["listing_url"])
+                dt = time.time() - t0
+                print(f"[pipeline] prewarm {group['name']}: {len(entries)} entries in {dt:.2f}s", flush=True)
+            except Exception as e:
+                print(f"[pipeline] prewarm failed for {group['name']}: {e}", flush=True)
+
+    # Run parent torrent prefetch and listing prewarm in parallel
+    t1 = threading.Thread(target=_prefetch, daemon=True)
+    t2 = threading.Thread(target=_prewarm_listings, daemon=True)
+    t1.start()
+    t2.start()
